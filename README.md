@@ -22,7 +22,7 @@ Both workers use smart caching to minimize API calls and stay within Cloudflare'
 
 ## Live Example
 
-You can see these workers in action on my blog: [aarongriffith.com](https://aarongriffith.com)
+You can see these workers in action on my blog: [aarongxa.com](https://aarongxa.com)
 
 The sidebar shows my current Spotify track with a live equalizer animation when music is playing, and displays the book I'm currently reading from Goodreads.
 
