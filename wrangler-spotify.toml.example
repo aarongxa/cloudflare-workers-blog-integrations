@@ -1,0 +1,22 @@
+name = "spotify-api"
+main = "spotify-worker.js"
+compatibility_date = "2024-01-01"
+
+# Replace YOUR_SPOTIFY_KV_NAMESPACE_ID with the ID from: wrangler kv namespace create "SPOTIFY_CACHE"
+kv_namespaces = [
+  { binding = "MY_KV_NAMESPACE", id = "YOUR_SPOTIFY_KV_NAMESPACE_ID" }
+]
+
+# Environment variables
+[vars]
+SPOTIFY_CLIENT_ID = "YOUR_SPOTIFY_CLIENT_ID"
+
+# Cron runs every 2 minutes (120 seconds) to align with schedule interval
+[triggers]
+crons = ["*/2 * * * *"]
+
+# Enable logging/observability (free tier: 200k events/day, 3-day retention)
+[observability]
+enabled = true
+head_sampling_rate = 1  # Log 100% of requests (adjust if needed to stay within limits)
+

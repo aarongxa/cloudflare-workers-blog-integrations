@@ -1,0 +1,17 @@
+name = "goodreads-api"
+main = "goodreads-worker.js"
+compatibility_date = "2024-01-01"
+
+# Replace YOUR_GOODREADS_KV_NAMESPACE_ID with the ID from: wrangler kv namespace create "GOODREADS_CACHE"
+kv_namespaces = [
+  { binding = "GOODREADS_CACHE", id = "YOUR_GOODREADS_KV_NAMESPACE_ID" }
+]
+
+# Environment variables
+[vars]
+GOODREADS_USER_ID = "YOUR_GOODREADS_USER_ID"
+
+# Update cache every 30 minutes
+[triggers]
+crons = ["*/30 * * * *"]
+

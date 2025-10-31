@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Wrangler config files with sensitive data
+wrangler-goodreads.toml
+wrangler-spotify.toml
+get-spotify-token.js
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Build outputs
+dist/
+build/
+.wrangler/
+
+# Temporary files
+*.tmp
+.cache/
+

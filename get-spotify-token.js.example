@@ -1,0 +1,75 @@
+// Helper script to get Spotify refresh token
+// Run once to authorize your Spotify app and get a refresh token
+// 
+// Usage:
+//   1. npm install express request
+//   2. Update CLIENT_ID and CLIENT_SECRET below
+//   3. node get-spotify-token.js
+//   4. Visit http://localhost:8888/login
+//   5. Save the refresh token for wrangler secrets
+
+const express = require('express');
+const request = require('request');
+
+// Replace these with your Spotify app credentials
+// Get them from: https://developer.spotify.com/dashboard
+const CLIENT_ID = 'YOUR_SPOTIFY_CLIENT_ID';
+const CLIENT_SECRET = 'YOUR_SPOTIFY_CLIENT_SECRET';
+const REDIRECT_URI = 'http://127.0.0.1:8888/callback';
+
+const app = express();
+
+app.get('/login', (req, res) => {
+  const scope = 'user-read-currently-playing user-read-recently-played';
+  res.redirect('https://accounts.spotify.com/authorize?' +
+    new URLSearchParams({
+      response_type: 'code',
+      client_id: CLIENT_ID,
+      scope: scope,
+      redirect_uri: REDIRECT_URI,
+    }));
+});
+
+app.get('/callback', (req, res) => {
+  const code = req.query.code;
+  
+  request.post({
+    url: 'https://accounts.spotify.com/api/token',
+    form: {
+      code: code,
+      redirect_uri: REDIRECT_URI,
+      grant_type: 'authorization_code',
+    },
+    headers: {
+      'Authorization': 'Basic ' + Buffer.from(CLIENT_ID + ':' + CLIENT_SECRET).toString('base64'),
+    },
+    json: true,
+  }, (error, response, body) => {
+    if (error) {
+      res.send('Error: ' + error);
+    } else {
+      res.send(`
+        <h1>Success!</h1>
+        <p><strong>Refresh Token (save this!):</strong></p>
+        <code style="background: #f4f4f4; padding: 10px; display: block; margin: 10px 0;">${body.refresh_token}</code>
+        <p><strong>Access Token (expires in 1 hour):</strong></p>
+        <code style="background: #f4f4f4; padding: 10px; display: block; margin: 10px 0;">${body.access_token}</code>
+        <hr>
+        <h3>Next Steps:</h3>
+        <ol>
+          <li>Copy the refresh token above</li>
+          <li>Run: <code>echo "YOUR_REFRESH_TOKEN" | wrangler secret put SPOTIFY_REFRESH_TOKEN --config wrangler-spotify.toml</code></li>
+          <li>Run: <code>echo "YOUR_CLIENT_SECRET" | wrangler secret put SPOTIFY_CLIENT_SECRET --config wrangler-spotify.toml</code></li>
+        </ol>
+        <p>You can close this window now.</p>
+      `);
+    }
+  });
+});
+
+app.listen(8888, '127.0.0.1', () => {
+  console.log('\n🎵 Spotify Token Helper\n');
+  console.log('Go to: http://127.0.0.1:8888/login');
+  console.log('\nWaiting for authorization...\n');
+});
+
