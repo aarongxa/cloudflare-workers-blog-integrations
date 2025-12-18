@@ -8,12 +8,15 @@ const CORS_HEADERS = {
   'Content-Type': 'application/json',
 };
 
+// Cache duration: 1 hour
+const CACHE_TTL_MS = 3600000;
+
 // Parse Goodreads RSS feed
-async function parseGoodreadsRSS(xml) {
+function parseGoodreadsRSS(xml) {
   const items = xml.match(/<item>[\s\S]*?<\/item>/g) || [];
   
   if (items.length === 0) {
-    return { current: null };
+    return { current: null, previous: null };
   }
   
   const books = items.map(item => {
@@ -28,23 +31,44 @@ async function parseGoodreadsRSS(xml) {
       return match ? match[1].trim() : '';
     };
     
-    const title = getField('title');
-    const author = getField('author_name');
-    const cover = getField('book_large_image_url');
-    const link = getField('link');
-    
     return {
-      title,
-      author,
-      cover,
-      link,
+      title: getField('title'),
+      author: getField('author_name'),
+      cover: getField('book_large_image_url'),
+      link: getField('link'),
     };
   });
   
-  // Return only the first book (most recently added to currently-reading)
   return {
     current: books[0] || null,
+    previous: books[1] || null,
   };
+}
+
+// Check if the book has changed (comparing title + author)
+function hasBookChanged(newBooks, existingBooks) {
+  if (!existingBooks?.current) return true;
+  if (!newBooks?.current) return false; // Don't treat null as a "change" - likely an error
+  
+  return newBooks.current.title !== existingBooks.current.title ||
+         newBooks.current.author !== existingBooks.current.author;
+}
+
+// Fetch RSS feed from Goodreads
+async function fetchGoodreadsRSS(userId) {
+  const rssUrl = `https://www.goodreads.com/review/list_rss/${userId}?shelf=currently-reading`;
+  
+  const response = await fetch(rssUrl, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (compatible; GoodreadsWorker/1.0)',
+    },
+  });
+  
+  if (!response.ok) {
+    throw new Error(`Goodreads RSS returned ${response.status}`);
+  }
+  
+  return response.text();
 }
 
 export default {
@@ -55,29 +79,36 @@ export default {
     }
     
     try {
-      // Check cache first (cache for 1 hour)
+      // Check cache first
       const cached = await env.GOODREADS_CACHE.get('books', 'json');
-      if (cached && cached.timestamp && Date.now() - cached.timestamp < 3600000) {
+      const cacheValid = cached?.timestamp && (Date.now() - cached.timestamp < CACHE_TTL_MS);
+      
+      if (cacheValid) {
         return new Response(JSON.stringify(cached.data), { headers: CORS_HEADERS });
       }
       
       // Fetch fresh data from Goodreads RSS
       const userId = env.GOODREADS_USER_ID;
-      const rssUrl = `https://www.goodreads.com/review/list_rss/${userId}?shelf=currently-reading`;
       
-      const response = await fetch(rssUrl);
-      const xml = await response.text();
-      
-      const books = await parseGoodreadsRSS(xml);
+      let books;
+      try {
+        const xml = await fetchGoodreadsRSS(userId);
+        books = parseGoodreadsRSS(xml);
+      } catch (fetchError) {
+        // If fetch fails but we have cached data, return stale cache
+        if (cached?.data) {
+          console.log('Fetch failed, returning stale cache:', fetchError.message);
+          return new Response(JSON.stringify(cached.data), { headers: CORS_HEADERS });
+        }
+        throw fetchError;
+      }
       
       // Only write to KV if the actual book changed (title + author)
+      // This prevents overwriting good data with null on temporary errors
       const existingBooks = cached?.data || null;
-      const bookChanged = !existingBooks?.current || 
-                          books.current?.title !== existingBooks?.current?.title ||
-                          books.current?.author !== existingBooks?.current?.author;
+      const bookChanged = hasBookChanged(books, existingBooks);
       
-      if (bookChanged || !existingBooks) {
-        // Cache the result only if book changed or no cache exists
+      if (bookChanged) {
         const cacheData = {
           data: books,
           timestamp: Date.now(),
@@ -85,17 +116,32 @@ export default {
         
         await env.GOODREADS_CACHE.put('books', JSON.stringify(cacheData));
         
-        console.log('Goodreads cache updated via fetch - book changed', {
-          oldBook: existingBooks?.current?.title || 'none',
-          newBook: books.current?.title || 'none',
+        console.log('Goodreads cache updated - book changed', {
+          old: existingBooks?.current?.title || 'none',
+          new: books.current?.title || 'none',
         });
+      } else if (!cached) {
+        // No existing cache, save even if null
+        const cacheData = {
+          data: books,
+          timestamp: Date.now(),
+        };
+        await env.GOODREADS_CACHE.put('books', JSON.stringify(cacheData));
+        console.log('Goodreads cache initialized');
       } else {
-        console.log('Goodreads book unchanged in fetch, skipping KV write');
+        // Just update timestamp to extend cache TTL
+        const cacheData = {
+          data: existingBooks,
+          timestamp: Date.now(),
+        };
+        await env.GOODREADS_CACHE.put('books', JSON.stringify(cacheData));
+        console.log('Goodreads cache TTL extended, book unchanged');
       }
       
       return new Response(JSON.stringify(books), { headers: CORS_HEADERS });
       
     } catch (error) {
+      console.error('Error in fetch handler:', error.message);
       return new Response(
         JSON.stringify({ error: 'Failed to fetch Goodreads data', message: error.message }),
         { status: 500, headers: CORS_HEADERS }
@@ -106,28 +152,28 @@ export default {
   // Scheduled event to keep cache warm
   async scheduled(event, env, ctx) {
     try {
-      // Get existing cached data to compare
       const existingCache = await env.GOODREADS_CACHE.get('books', 'json');
       const existingBooks = existingCache?.data || null;
       
       const userId = env.GOODREADS_USER_ID;
-      const rssUrl = `https://www.goodreads.com/review/list_rss/${userId}?shelf=currently-reading`;
       
-      const response = await fetch(rssUrl);
-      const xml = await response.text();
+      let xml;
+      try {
+        xml = await fetchGoodreadsRSS(userId);
+      } catch (fetchError) {
+        console.error('Scheduled fetch failed:', fetchError.message);
+        // Don't update cache on fetch failure - keep existing data
+        return;
+      }
       
-      const books = await parseGoodreadsRSS(xml);
+      const books = parseGoodreadsRSS(xml);
       
-      // Only write to KV if the actual BOOK changed (title + author comparison)
-      // This ignores changes in cover URLs, links, or other metadata
-      const bookChanged = !existingBooks?.current || 
-                          books.current?.title !== existingBooks.current?.title ||
-                          books.current?.author !== existingBooks.current?.author;
+      // Only write to KV if the actual book changed
+      const bookChanged = hasBookChanged(books, existingBooks);
       
       if (!bookChanged && existingBooks) {
-        console.log('Goodreads book unchanged (same title/author), skipping KV write', {
+        console.log('Scheduled: Book unchanged, skipping KV write', {
           title: books.current?.title,
-          author: books.current?.author,
         });
         return;
       }
@@ -139,14 +185,12 @@ export default {
       
       await env.GOODREADS_CACHE.put('books', JSON.stringify(cacheData));
       
-      console.log('Goodreads cache updated via cron - book changed', {
-        oldBook: existingBooks?.current?.title || 'none',
-        newBook: books.current?.title || 'none',
-        author: books.current?.author,
+      console.log('Scheduled: Goodreads cache updated', {
+        old: existingBooks?.current?.title || 'none',
+        new: books.current?.title || 'none',
       });
     } catch (error) {
-      console.error('Failed to update Goodreads cache:', error);
+      console.error('Scheduled handler failed:', error);
     }
   },
 };
-
