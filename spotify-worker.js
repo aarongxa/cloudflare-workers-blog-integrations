@@ -11,7 +11,8 @@ const CORS_HEADERS = {
 };
 
 const TOKEN_ENDPOINT = 'https://accounts.spotify.com/api/token';
-const NOW_PLAYING_ENDPOINT = 'https://api.spotify.com/v1/me/player/currently-playing';
+// Must include additional_types=episode to get podcast episodes
+const NOW_PLAYING_ENDPOINT = 'https://api.spotify.com/v1/me/player/currently-playing?additional_types=episode';
 const RECENTLY_PLAYED_ENDPOINT = 'https://api.spotify.com/v1/me/player/recently-played?limit=1';
 const KV_KEY = 'current_track';
 const KV_TTL = 300; // 300 seconds expiration
