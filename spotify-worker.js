@@ -13,11 +13,18 @@ const CORS_HEADERS = {
 const TOKEN_ENDPOINT = 'https://accounts.spotify.com/api/token';
 // Must include additional_types=episode to get podcast episodes
 const NOW_PLAYING_ENDPOINT = 'https://api.spotify.com/v1/me/player/currently-playing?additional_types=episode';
+// NOTE: Spotify's recently-played endpoint does NOT return podcast episodes,
+// only music tracks. We work around this by preserving cached episodes whose
+// lastSeenAt is newer than the most recent music track's played_at timestamp.
 const RECENTLY_PLAYED_ENDPOINT = 'https://api.spotify.com/v1/me/player/recently-played?limit=1';
 const KV_KEY = 'current_track';
 const KV_TTL = 300; // 300 seconds expiration
 const SCHEDULE_INTERVAL = 120000; // 120 seconds (2 minutes) to match cron interval
 const FETCH_CACHE_TTL = 30000; // 30 seconds cache for fetch handler
+// When a podcast episode is still playing after a long time, refresh its
+// lastSeenAt periodically so a stale timestamp can't lose to a newer
+// recently-played music track once the episode is paused.
+const EPISODE_LAST_SEEN_REFRESH_MS = 15 * 60 * 1000; // 15 minutes
 
 // Helper function for structured logging
 function log(level, message, data = {}) {
@@ -173,6 +180,9 @@ async function getNowPlaying(accessToken) {
     songUrl: item.external_urls?.spotify || '',
     trackId: item.id, // For comparison
     type: currentlyPlayingType || 'track', // 'track' or 'episode'
+    // Timestamp of when we observed this item playing. Critical for episodes
+    // because Spotify's recently-played endpoint omits them.
+    lastSeenAt: Date.now(),
   };
   
   log('info', 'Successfully fetched currently playing item', {
@@ -202,7 +212,8 @@ async function getRecentlyPlayed(accessToken) {
   }
   
   const data = await response.json();
-  const item = data.items[0]?.track || data.items[0]?.episode; // Support both tracks and episodes
+  const entry = data.items[0];
+  const item = entry?.track || entry?.episode; // Spotify only returns tracks here today
   
   if (!item) {
     log('warn', 'No recently played items found');
@@ -210,6 +221,12 @@ async function getRecentlyPlayed(accessToken) {
   }
   
   const isEpisode = item.type === 'episode' || !item.artists; // Fallback detection
+  
+  // Capture the actual play timestamp from Spotify so we can reason about
+  // whether a cached podcast episode is newer than the last played music track.
+  const playedAtMs = entry?.played_at
+    ? Date.parse(entry.played_at)
+    : Date.now();
   
   const trackData = {
     isPlaying: false,
@@ -226,6 +243,7 @@ async function getRecentlyPlayed(accessToken) {
     songUrl: item.external_urls?.spotify || '',
     trackId: item.id, // For comparison
     type: item.type || (isEpisode ? 'episode' : 'track'),
+    lastSeenAt: Number.isFinite(playedAtMs) ? playedAtMs : Date.now(),
   };
   
   log('info', 'Successfully fetched recently played item', {
@@ -233,9 +251,45 @@ async function getRecentlyPlayed(accessToken) {
     title: trackData.title,
     artist: trackData.artist,
     type: trackData.type,
+    playedAt: entry?.played_at,
   });
   
   return trackData;
+}
+
+// Decide which item represents the user's most recent listening activity when
+// nothing is currently playing. Spotify's recently-played endpoint omits
+// podcast episodes, so we need to preserve a cached episode whenever it was
+// observed more recently than the most recent music track.
+//
+// Returns an object describing the chosen track (with isPlaying forced to
+// false) and where it came from, or null if no data is available.
+function pickLastListened(existingTrack, recentlyPlayed) {
+  const existingLastSeenAt = existingTrack?.lastSeenAt || 0;
+  const recentLastSeenAt = recentlyPlayed?.lastSeenAt || 0;
+  const existingIsEpisode = existingTrack?.type === 'episode';
+  
+  // If the cached item is an episode and we have no evidence of newer music,
+  // keep showing the episode. This is the core "podcasts should stick" fix.
+  if (existingIsEpisode && existingLastSeenAt >= recentLastSeenAt) {
+    return {
+      track: { ...existingTrack, isPlaying: false },
+      source: 'cached_episode',
+    };
+  }
+  
+  if (recentlyPlayed) {
+    return { track: recentlyPlayed, source: 'recently_played' };
+  }
+  
+  if (existingTrack) {
+    return {
+      track: { ...existingTrack, isPlaying: false },
+      source: 'cached_fallback',
+    };
+  }
+  
+  return null;
 }
 
 // Compare two track objects for equality
@@ -283,17 +337,28 @@ export default {
       // Get fresh access token
       const { access_token } = await getAccessToken(env);
       
+      const existingTrack = cached?.data || null;
+      
       // Try to get currently playing
       let track = await getNowPlaying(access_token);
       
-      // If nothing playing, get recently played
+      // If nothing playing, decide between cached episode and recently played music
       if (!track) {
-        log('info', 'No currently playing track, fetching recently played');
-        track = await getRecentlyPlayed(access_token);
+        log('info', 'No currently playing track, evaluating fallback');
+        const recentlyPlayed = await getRecentlyPlayed(access_token);
+        const picked = pickLastListened(existingTrack, recentlyPlayed);
+        if (picked) {
+          track = picked.track;
+          log('info', 'Selected fallback track', {
+            source: picked.source,
+            trackId: track.trackId,
+            title: track.title,
+            type: track.type,
+          });
+        }
       }
       
       // Only write to KV if track changed (reduces unnecessary writes)
-      const existingTrack = cached?.data || null;
       if (!tracksEqual(track, existingTrack)) {
         const cacheData = {
           data: track,
@@ -380,31 +445,31 @@ export default {
       try {
         newTrack = await getNowPlaying(access_token);
         
-        // If nothing playing, always check recently played to get the latest track
-        // This ensures we update when a new track starts even if it's not currently "playing"
+        // If nothing playing, decide between cached episode and recently played music
         if (!newTrack) {
-          log('info', 'No track currently playing, fetching recently played track');
+          log('info', 'No track currently playing, evaluating fallback');
           const recentlyPlayed = await getRecentlyPlayed(access_token);
+          const picked = pickLastListened(existingTrack, recentlyPlayed);
           
-          // Use recently played if available, otherwise keep existing (if exists)
-          if (recentlyPlayed) {
-            newTrack = recentlyPlayed;
-            log('info', 'Using recently played track', {
-              trackId: newTrack.trackId,
-              title: newTrack.title,
-            });
-          } else if (existingTrack) {
-            // No recently played and nothing currently playing, keep existing
-            // Only update lastRun timestamp if track changed or if we need to track runs
-            log('info', 'No recently played track found, keeping existing track data', {
-              existingTrackId: existingTrack.trackId,
-            });
-            // Skip write - track unchanged, no KV write needed
-            return;
-          } else {
-            // No data at all
+          if (!picked) {
             log('info', 'No track data available (no current, no recently played, no existing)');
-            // Skip write - no data to store
+            return;
+          }
+          
+          newTrack = picked.track;
+          log('info', 'Selected fallback track', {
+            source: picked.source,
+            trackId: newTrack.trackId,
+            title: newTrack.title,
+            type: newTrack.type,
+          });
+          
+          // If we kept the existing cached episode and it matches what's
+          // already stored (same trackId + isPlaying), skip the KV write.
+          if (picked.source === 'cached_episode' && tracksEqual(newTrack, existingTrack)) {
+            log('info', 'Cached podcast episode preserved, skipping KV write', {
+              trackId: newTrack.trackId,
+            });
             return;
           }
         }
@@ -421,13 +486,28 @@ export default {
       
       // Compare new track with stored track
       if (tracksEqual(newTrack, existingTrack)) {
-        // Track hasn't changed, skip write to minimize KV operations
-        log('info', 'Track unchanged, skipping KV write', {
-          trackId: newTrack?.trackId,
-          title: newTrack?.title,
+        // Long podcast sessions: refresh lastSeenAt occasionally so it stays
+        // newer than any stale recently-played music timestamp.
+        const isEpisodeStillPlaying =
+          newTrack?.type === 'episode' && newTrack?.isPlaying;
+        const existingLastSeenAt = existingTrack?.lastSeenAt || 0;
+        const staleEpisode =
+          isEpisodeStillPlaying &&
+          now - existingLastSeenAt > EPISODE_LAST_SEEN_REFRESH_MS;
+        
+        if (!staleEpisode) {
+          log('info', 'Track unchanged, skipping KV write', {
+            trackId: newTrack?.trackId,
+            title: newTrack?.title,
+          });
+          return;
+        }
+        
+        log('info', 'Refreshing lastSeenAt for long-running episode', {
+          trackId: newTrack.trackId,
+          title: newTrack.title,
+          previousLastSeenAt: existingLastSeenAt,
         });
-        // No KV write needed - track unchanged
-        return;
       }
       
       // Track changed or no data existed - write to KV (only write when data changes)

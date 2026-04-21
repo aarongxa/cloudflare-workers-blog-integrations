@@ -279,11 +279,38 @@ Returns `null` if no currently reading book is found.
   "albumArt": "https://i.scdn.co/image/...",
   "songUrl": "https://open.spotify.com/track/...",
   "trackId": "4u7EnebtmKWzUH433cf5Qv",
-  "type": "track"
+  "type": "track",
+  "lastSeenAt": 1745251200000
 }
 ```
 
 The `type` field can be `"track"` (music) or `"episode"` (podcast).
+
+`lastSeenAt` is a millisecond timestamp that records when we last observed
+the item. For currently-playing items it is `Date.now()` at the time of
+observation; for items sourced from Spotify's recently-played endpoint it is
+the API's `played_at` value. It's the key to making podcast episodes "stick"
+(see below).
+
+### Making Podcasts Stick
+
+Spotify's `/me/player/recently-played` endpoint **does not return podcast
+episodes**, only music tracks. Without any workaround, a podcast vanishes
+from the widget the moment you pause it — the worker would see "nothing
+currently playing" and fall back to the most recent music track (which could
+be hours old), effectively overwriting your podcast with stale music.
+
+To fix this, the Spotify worker keeps a `lastSeenAt` timestamp on every
+cached item and uses these rules when nothing is actively playing:
+
+1. If the cached item is a podcast episode whose `lastSeenAt` is newer than
+   the most recent music track's `played_at`, keep showing the episode.
+2. Otherwise fall back to the recently-played music track.
+3. If neither source has data, keep whatever is already cached.
+
+For long podcast sessions, the worker also refreshes `lastSeenAt` on the
+currently-playing episode every 15 minutes so a cached timestamp can't go
+stale faster than the user can finish listening.
 
 ## Monitoring and Debugging
 
